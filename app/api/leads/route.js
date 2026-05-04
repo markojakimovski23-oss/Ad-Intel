@@ -33,7 +33,7 @@ async function parsePrompt(prompt) {
   const result = await groq([
     {
       role: "system",
-      content: "Parse lead generation prompts into Apollo.io search parameters. Return ONLY valid JSON. No markdown.",
+      content: "Parse lead generation prompts into search parameters. Return ONLY valid JSON. No markdown.",
     },
     {
       role: "user",
@@ -41,12 +41,12 @@ async function parsePrompt(prompt) {
 
 Return JSON:
 {
-  "keywords": "industry keywords for company search",
-  "locations": ["City, Country"],
-  "company_size_min": 1,
-  "company_size_max": 1000,
-  "job_titles": ["CEO", "Owner", "Marketing Manager", "Director"],
-  "technologies": ["Facebook Ads", "Google Ads"],
+  "keywords": ["keyword1", "keyword2"],
+  "industry": "specific industry name e.g. health wellness fitness / restaurants food / real estate / automotive",
+  "city": "city name only e.g. Dubai",
+  "country": "country name only e.g. United Arab Emirates",
+  "company_size_max": 500,
+  "job_titles": ["CEO", "Owner", "Marketing Manager"],
   "signal": "what makes them a hot lead"
 }`,
     },
@@ -56,61 +56,12 @@ Return JSON:
     return JSON.parse(repairJSON(result));
   } catch (e) {
     return {
-      keywords: prompt,
-      locations: [],
+      keywords: [prompt],
+      industry: prompt,
+      city: null,
+      country: null,
       job_titles: ["CEO", "Owner", "Marketing Manager"],
-      technologies: [],
     };
-  }
-}
-
-async function searchApolloPeople(searchParams) {
-  try {
-    if (!process.env.APOLLO_API_KEY) return null;
-
-    const body = {
-      q_keywords: searchParams.keywords || "",
-      page: 1,
-      per_page: 25,
-      person_titles: searchParams.job_titles || ["CEO", "Owner", "Founder", "Marketing Director", "Marketing Manager"],
-      prospected_by_current_team: ["no"],
-    };
-
-    if (searchParams.locations?.length > 0) {
-      body.person_locations = searchParams.locations;
-      body.organization_locations = searchParams.locations;
-    }
-
-    if (searchParams.company_size_min || searchParams.company_size_max) {
-      body.organization_num_employees_ranges = [
-        `${searchParams.company_size_min || 1},${searchParams.company_size_max || 500}`
-      ];
-    }
-
-    if (searchParams.technologies?.length > 0) {
-      body.organization_technology_names = searchParams.technologies;
-    }
-
-    const res = await fetch("https://api.apollo.io/v1/mixed_people/search", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Cache-Control": "no-cache",
-        "X-Api-Key": process.env.APOLLO_API_KEY,
-      },
-      body: JSON.stringify(body),
-    });
-
-    if (!res.ok) {
-      console.error("Apollo people error:", res.status, await res.text());
-      return null;
-    }
-
-    const data = await res.json();
-    return data.people || null;
-  } catch (e) {
-    console.error("Apollo people search error:", e.message);
-    return null;
   }
 }
 
@@ -119,24 +70,29 @@ async function searchApolloOrganizations(searchParams) {
     if (!process.env.APOLLO_API_KEY) return null;
 
     const body = {
-      q_organization_keyword_tags: searchParams.keywords || "",
       page: 1,
       per_page: 25,
     };
 
-    if (searchParams.locations?.length > 0) {
-      body.organization_locations = searchParams.locations;
+    // Keywords as array
+    if (searchParams.keywords?.length > 0) {
+      body.q_organization_keyword_tags = searchParams.keywords;
     }
 
-    if (searchParams.company_size_min || searchParams.company_size_max) {
-      body.organization_num_employees_ranges = [
-        `${searchParams.company_size_min || 1},${searchParams.company_size_max || 500}`
-      ];
+    // Location
+    const locationParts = [];
+    if (searchParams.city) locationParts.push(searchParams.city);
+    if (searchParams.country) locationParts.push(searchParams.country);
+    if (locationParts.length > 0) {
+      body.organization_locations = [locationParts.join(', ')];
     }
 
-    if (searchParams.technologies?.length > 0) {
-      body.organization_technology_names = searchParams.technologies;
+    // Company size
+    if (searchParams.company_size_max) {
+      body.organization_num_employees_ranges = [`1,${searchParams.company_size_max}`];
     }
+
+    console.log("Apollo org body:", JSON.stringify(body));
 
     const res = await fetch("https://api.apollo.io/v1/organizations/search", {
       method: "POST",
@@ -148,12 +104,12 @@ async function searchApolloOrganizations(searchParams) {
       body: JSON.stringify(body),
     });
 
-    if (!res.ok) {
-      console.error("Apollo org error:", res.status, await res.text());
-      return null;
-    }
+    const responseText = await res.text();
+    console.log("Apollo org response:", res.status, responseText.slice(0, 300));
 
-    const data = await res.json();
+    if (!res.ok) return null;
+
+    const data = JSON.parse(responseText);
     return data.organizations || null;
   } catch (e) {
     console.error("Apollo org search error:", e.message);
@@ -207,6 +163,23 @@ async function getMetaAds(companyName) {
   }
 }
 
+async function getHunterEmails(domain) {
+  try {
+    if (!process.env.HUNTER_API_KEY) return [];
+    const res = await fetch(`https://api.hunter.io/v2/domain-search?domain=${domain}&limit=2&api_key=${process.env.HUNTER_API_KEY}`);
+    const data = await res.json();
+    if (!data.data?.emails?.length) return [];
+    return data.data.emails.slice(0, 2).map(e => ({
+      name: `${e.first_name || ''} ${e.last_name || ''}`.trim() || 'Unknown',
+      title: e.position || 'Unknown',
+      email: e.value,
+      decision_maker_score: ['ceo', 'owner', 'founder', 'director', 'cmo', 'vp'].some(t => e.position?.toLowerCase().includes(t)) ? 9 : 6,
+    }));
+  } catch (e) {
+    return [];
+  }
+}
+
 export async function POST(request) {
   try {
     const { prompt } = await request.json();
@@ -215,66 +188,26 @@ export async function POST(request) {
     const searchParams = await parsePrompt(prompt);
     console.log("Search params:", JSON.stringify(searchParams));
 
-    const [apolloPeople, apolloOrgs] = await Promise.all([
-      searchApolloPeople(searchParams),
-      searchApolloOrganizations(searchParams),
-    ]);
-
-    console.log(`Apollo people: ${apolloPeople?.length || 0}, orgs: ${apolloOrgs?.length || 0}`);
+    const apolloOrgs = await searchApolloOrganizations(searchParams);
+    console.log(`Apollo orgs: ${apolloOrgs?.length || 0}`);
 
     const companiesMap = new Map();
-
-    if (apolloPeople?.length > 0) {
-      for (const person of apolloPeople) {
-        const org = person.organization;
-        if (!org) continue;
-        const domain = org.primary_domain || org.website_url?.replace(/^https?:\/\//, '').replace(/\/$/, '');
-        if (!domain) continue;
-
-        if (!companiesMap.has(domain)) {
-          companiesMap.set(domain, {
-            company_name: org.name,
-            domain,
-            industry: org.industry || 'Unknown',
-            location: `${org.city || ''}, ${org.country || ''}`.replace(/^, |, $/, ''),
-            company_size: org.num_employees,
-            estimated_revenue: org.annual_revenue_printed || null,
-            founded_year: org.founded_year || null,
-            linkedin_url: org.linkedin_url || null,
-            website: org.website_url || null,
-            technologies: org.current_technologies?.map(t => t.name) || [],
-            contacts: [],
-          });
-        }
-
-        const company = companiesMap.get(domain);
-        if (company.contacts.length < 3) {
-          company.contacts.push({
-            name: `${person.first_name || ''} ${person.last_name || ''}`.trim(),
-            title: person.title || 'Unknown',
-            email: person.email || null,
-            linkedin: person.linkedin_url || null,
-            phone: person.phone_numbers?.[0]?.sanitized_number || null,
-            decision_maker_score: ['ceo', 'owner', 'founder', 'director', 'cmo', 'vp', 'head'].some(t => person.title?.toLowerCase().includes(t)) ? 9 : 6,
-          });
-        }
-      }
-    }
 
     if (apolloOrgs?.length > 0) {
       for (const org of apolloOrgs) {
         const domain = org.primary_domain || org.website_url?.replace(/^https?:\/\//, '').replace(/\/$/, '');
-        if (!domain || companiesMap.has(domain)) continue;
+        if (!domain) continue;
 
         companiesMap.set(domain, {
           company_name: org.name,
           domain,
           industry: org.industry || 'Unknown',
-          location: `${org.city || ''}, ${org.country || ''}`.replace(/^, |, $/, ''),
+          location: [org.city, org.state, org.country].filter(Boolean).join(', '),
           company_size: org.num_employees,
           estimated_revenue: org.annual_revenue_printed || null,
           founded_year: org.founded_year || null,
           linkedin_url: org.linkedin_url || null,
+          phone: org.phone || null,
           website: org.website_url || null,
           technologies: org.current_technologies?.map(t => t.name) || [],
           contacts: [],
@@ -287,15 +220,19 @@ export async function POST(request) {
 
     if (companies.length === 0) {
       return Response.json({
-        error: "No companies found. Try different keywords or location.",
+        error: "No companies found. Try broader keywords like 'gym' instead of 'gyms in Dubai', or try a different location format.",
         prompt,
         search_params: searchParams,
+        debug: "Apollo returned 0 results — try simpler keywords",
       }, { status: 404 });
     }
 
-    // Check Meta ads for top 3 companies
+    // Check Meta ads + Hunter emails for top companies in parallel
     const topCompanies = companies.slice(0, 3);
-    const metaChecks = await Promise.all(topCompanies.map(c => getMetaAds(c.company_name)));
+    const [metaChecks, hunterResults] = await Promise.all([
+      Promise.all(topCompanies.map(c => getMetaAds(c.company_name))),
+      Promise.all(companies.slice(0, 8).map(c => c.domain ? getHunterEmails(c.domain) : [])),
+    ]);
 
     topCompanies.forEach((company, i) => {
       if (metaChecks[i]?.length > 0) {
@@ -306,8 +243,12 @@ export async function POST(request) {
           body: ad.adCreativeBody?.slice(0, 100),
           snapshot: ad.adSnapshotUrl,
         }));
-      } else {
-        company.meta_active = false;
+      }
+    });
+
+    companies.slice(0, 8).forEach((company, i) => {
+      if (hunterResults[i]?.length > 0) {
+        company.contacts = hunterResults[i];
       }
     });
 
@@ -323,34 +264,33 @@ export async function POST(request) {
 Companies found from Apollo database:
 ${JSON.stringify(companies, null, 2).slice(0, 6000)}
 
-Qualify each company as a lead. Score them, identify pain points, create personalised outreach.
+Qualify each company. Score them, identify pain points, create personalised outreach. Use ONLY the exact company names and domains from the data above.
 
 Return JSON:
 {
   "total_found": ${companies.length},
-  "search_summary": "What was found and why these are good leads",
-  "data_source": "Apollo.io database",
+  "search_summary": "Brief summary of what was found",
   "leads": [
     {
       "company_name": "exact name from data",
       "domain": "exact domain from data",
-      "industry": "exact industry from data",
-      "location": "exact location from data",
-      "company_size": "employees count",
-      "estimated_revenue": "revenue if available",
+      "industry": "industry from data",
+      "location": "location from data",
+      "company_size": "size from data",
+      "estimated_revenue": "revenue from data or null",
       "technologies_detected": ["tech1", "tech2"],
-      "linkedin_url": "linkedin url if available",
-      "signal_score": 0-100,
+      "linkedin_url": "url from data or null",
+      "signal_score": 75,
       "hot_lead": true,
       "why_qualified": "specific reason this matches the search",
       "ad_activity": {
-        "meta": {"active": true, "ad_count": "unknown", "spend_estimate": "unknown"},
+        "meta": {"active": false, "ad_count": "unknown", "spend_estimate": "unknown"},
         "google": {"active": false},
         "linkedin": {"active": false}
       },
-      "pain_points": ["specific pain point 1", "specific pain point 2", "specific pain point 3"],
-      "best_angle": "specific personalised outreach angle",
-      "dm_opener": "Ready to send personalised DM",
+      "pain_points": ["pain point 1", "pain point 2", "pain point 3"],
+      "best_angle": "specific outreach angle for this company",
+      "dm_opener": "Personalised ready-to-send DM",
       "email_subject": "Specific subject line",
       "whatsapp_message": "Short WhatsApp message",
       "contacts": []
@@ -367,6 +307,7 @@ Return JSON:
       throw new Error(`Failed to parse leads: ${e.message}`);
     }
 
+    // Merge real contacts and meta ads
     if (leadsData.leads?.length > 0) {
       leadsData.leads = leadsData.leads.map(lead => {
         const apolloCompany = companiesMap.get(lead.domain);
@@ -387,7 +328,6 @@ Return JSON:
     leadsData.prompt = prompt;
     leadsData.search_params = searchParams;
     leadsData.apollo_results = {
-      people_found: apolloPeople?.length || 0,
       orgs_found: apolloOrgs?.length || 0,
       unique_companies: companies.length,
     };
