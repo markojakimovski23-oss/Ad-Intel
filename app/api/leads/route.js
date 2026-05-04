@@ -39,18 +39,14 @@ async function parsePrompt(prompt) {
       role: "user",
       content: `Parse this lead search request: "${prompt}"
 
-Return JSON with Apollo search parameters:
+Return JSON:
 {
   "keywords": "industry keywords for company search",
-  "industry_tags": ["industry1", "industry2"],
   "locations": ["City, Country"],
   "company_size_min": 1,
   "company_size_max": 1000,
   "job_titles": ["CEO", "Owner", "Marketing Manager", "Director"],
-  "ad_platforms": ["facebook", "google", "linkedin"],
-  "revenue_range": "any specific revenue signal or null",
   "technologies": ["Facebook Ads", "Google Ads"],
-  "exclude_keywords": ["enterprise", "global"],
   "signal": "what makes them a hot lead"
 }`,
     },
@@ -68,13 +64,11 @@ Return JSON with Apollo search parameters:
   }
 }
 
-async function searchApollo(searchParams) {
+async function searchApolloPeople(searchParams) {
   try {
     if (!process.env.APOLLO_API_KEY) return null;
 
-    // Search for people (contacts) at matching companies
     const body = {
-      api_key: process.env.APOLLO_API_KEY,
       q_keywords: searchParams.keywords || "",
       page: 1,
       per_page: 25,
@@ -82,25 +76,17 @@ async function searchApollo(searchParams) {
       prospected_by_current_team: ["no"],
     };
 
-    // Add locations if specified
     if (searchParams.locations?.length > 0) {
       body.person_locations = searchParams.locations;
       body.organization_locations = searchParams.locations;
     }
 
-    // Add industry tags
-    if (searchParams.industry_tags?.length > 0) {
-      body.organization_industry_tag_ids = searchParams.industry_tags;
-    }
-
-    // Add company size range
     if (searchParams.company_size_min || searchParams.company_size_max) {
       body.organization_num_employees_ranges = [
         `${searchParams.company_size_min || 1},${searchParams.company_size_max || 500}`
       ];
     }
 
-    // Add technology filters
     if (searchParams.technologies?.length > 0) {
       body.organization_technology_names = searchParams.technologies;
     }
@@ -110,19 +96,20 @@ async function searchApollo(searchParams) {
       headers: {
         "Content-Type": "application/json",
         "Cache-Control": "no-cache",
+        "X-Api-Key": process.env.APOLLO_API_KEY,
       },
       body: JSON.stringify(body),
     });
 
     if (!res.ok) {
-      console.error("Apollo error:", res.status, await res.text());
+      console.error("Apollo people error:", res.status, await res.text());
       return null;
     }
 
     const data = await res.json();
     return data.people || null;
   } catch (e) {
-    console.error("Apollo search error:", e.message);
+    console.error("Apollo people search error:", e.message);
     return null;
   }
 }
@@ -132,7 +119,6 @@ async function searchApolloOrganizations(searchParams) {
     if (!process.env.APOLLO_API_KEY) return null;
 
     const body = {
-      api_key: process.env.APOLLO_API_KEY,
       q_organization_keyword_tags: searchParams.keywords || "",
       page: 1,
       per_page: 25,
@@ -157,6 +143,7 @@ async function searchApolloOrganizations(searchParams) {
       headers: {
         "Content-Type": "application/json",
         "Cache-Control": "no-cache",
+        "X-Api-Key": process.env.APOLLO_API_KEY,
       },
       body: JSON.stringify(body),
     });
@@ -225,22 +212,18 @@ export async function POST(request) {
     const { prompt } = await request.json();
     if (!prompt) return Response.json({ error: "Prompt is required" }, { status: 400 });
 
-    // Step 1: Parse prompt into search parameters
     const searchParams = await parsePrompt(prompt);
     console.log("Search params:", JSON.stringify(searchParams));
 
-    // Step 2: Search Apollo for real companies and contacts in parallel
     const [apolloPeople, apolloOrgs] = await Promise.all([
-      searchApollo(searchParams),
+      searchApolloPeople(searchParams),
       searchApolloOrganizations(searchParams),
     ]);
 
     console.log(`Apollo people: ${apolloPeople?.length || 0}, orgs: ${apolloOrgs?.length || 0}`);
 
-    // Step 3: Build lead list from Apollo data
     const companiesMap = new Map();
 
-    // Process people results - group by company
     if (apolloPeople?.length > 0) {
       for (const person of apolloPeople) {
         const org = person.organization;
@@ -264,7 +247,6 @@ export async function POST(request) {
           });
         }
 
-        // Add contact
         const company = companiesMap.get(domain);
         if (company.contacts.length < 3) {
           company.contacts.push({
@@ -279,7 +261,6 @@ export async function POST(request) {
       }
     }
 
-    // Process org results
     if (apolloOrgs?.length > 0) {
       for (const org of apolloOrgs) {
         const domain = org.primary_domain || org.website_url?.replace(/^https?:\/\//, '').replace(/\/$/, '');
@@ -312,11 +293,9 @@ export async function POST(request) {
       }, { status: 404 });
     }
 
-    // Step 4: Check Meta ads for top 3 companies in parallel
+    // Check Meta ads for top 3 companies
     const topCompanies = companies.slice(0, 3);
-    const metaChecks = await Promise.all(
-      topCompanies.map(c => getMetaAds(c.company_name))
-    );
+    const metaChecks = await Promise.all(topCompanies.map(c => getMetaAds(c.company_name)));
 
     topCompanies.forEach((company, i) => {
       if (metaChecks[i]?.length > 0) {
@@ -332,7 +311,6 @@ export async function POST(request) {
       }
     });
 
-    // Step 5: AI qualifies and scores all leads
     const qualificationResult = await groq([
       {
         role: "system",
@@ -345,37 +323,37 @@ export async function POST(request) {
 Companies found from Apollo database:
 ${JSON.stringify(companies, null, 2).slice(0, 6000)}
 
-Qualify each company as a lead for a digital marketing agency. Score them, identify pain points, and create personalised outreach.
+Qualify each company as a lead. Score them, identify pain points, create personalised outreach.
 
 Return JSON:
 {
   "total_found": ${companies.length},
-  "search_summary": "What was found and why these are good leads for the search criteria",
-  "data_source": "Apollo.io database — real companies",
+  "search_summary": "What was found and why these are good leads",
+  "data_source": "Apollo.io database",
   "leads": [
     {
       "company_name": "exact name from data",
       "domain": "exact domain from data",
       "industry": "exact industry from data",
       "location": "exact location from data",
-      "company_size": "number of employees",
+      "company_size": "employees count",
       "estimated_revenue": "revenue if available",
       "technologies_detected": ["tech1", "tech2"],
+      "linkedin_url": "linkedin url if available",
       "signal_score": 0-100,
-      "hot_lead": true or false,
-      "why_qualified": "specific reason this matches the search criteria",
+      "hot_lead": true,
+      "why_qualified": "specific reason this matches the search",
       "ad_activity": {
-        "meta": {"active": true or false, "ad_count": "number or unknown", "spend_estimate": "estimate or unknown"},
-        "google": {"active": true or false},
-        "linkedin": {"active": true or false}
+        "meta": {"active": true, "ad_count": "unknown", "spend_estimate": "unknown"},
+        "google": {"active": false},
+        "linkedin": {"active": false}
       },
       "pain_points": ["specific pain point 1", "specific pain point 2", "specific pain point 3"],
-      "best_angle": "specific personalised outreach angle for this company",
-      "dm_opener": "Ready to send personalised DM referencing something specific about their business",
-      "email_subject": "Specific email subject line",
-      "whatsapp_message": "Short punchy WhatsApp message",
-      "contacts": [],
-      "linkedin_url": "company linkedin url if available"
+      "best_angle": "specific personalised outreach angle",
+      "dm_opener": "Ready to send personalised DM",
+      "email_subject": "Specific subject line",
+      "whatsapp_message": "Short WhatsApp message",
+      "contacts": []
     }
   ]
 }`,
@@ -389,14 +367,12 @@ Return JSON:
       throw new Error(`Failed to parse leads: ${e.message}`);
     }
 
-    // Merge real contacts from Apollo into qualified leads
     if (leadsData.leads?.length > 0) {
       leadsData.leads = leadsData.leads.map(lead => {
         const apolloCompany = companiesMap.get(lead.domain);
         if (apolloCompany?.contacts?.length > 0) {
           lead.contacts = apolloCompany.contacts;
         }
-        // Add meta ads data if available
         const metaIdx = topCompanies.findIndex(c => c.domain === lead.domain);
         if (metaIdx >= 0 && topCompanies[metaIdx].meta_active) {
           lead.ad_activity.meta.active = true;
